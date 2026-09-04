@@ -2,7 +2,7 @@ name: Instagram自動投稿
 
 on:
   schedule:
-    # UTC 0:00 = 日本時間 9:00。時刻を変えたい場合はここを編集
+    # UTC 0:00 = 日本時間 17:00。時刻を変えたい場合はここを編集
     - cron: "0 0 * * *"
   workflow_dispatch: {}   # Actionsタブから手動実行するためのボタン
 
