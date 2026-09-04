@@ -1,32 +1,42 @@
 """
-Notionカレンダーは使わず、posts/ フォルダに置かれた投稿を
-古い順(フォルダ名の昇順)に1件だけInstagramへ自動投稿するスクリプト。
+Notionの「SNS投稿カレンダー」を投稿キューとして、Instagramへ自動投稿するスクリプト。
 
-posts/01_example/
-    caption.txt   ... 投稿本文(1行目でもOK、複数行可)
-    1.jpg
-    2.jpg
-    3.jpg         ... 画像は最大10枚まで(カルーセル投稿に対応)
+対象にする行の条件:
+  - ステータス == "予約済み"
+  - チェックボックス == オフ(未投稿)
+  - プラットフォーム に "Instagram \U0001F4F8" を含む
+  - 投稿日付 <= 今日
 
-投稿に成功したフォルダは posts_done/ に移動する。
-GitHub Actions から実行される想定(スケジュール実行)。
+ページ本文の構成:
+  ### 元画像       ... 撮影した画像(カルーセル投稿の元ネタ)
+  ### 投稿画像     ... 実際に使う画像。空 or 「元画像と同じ」なら元画像を使う
+  ### 投稿内容     ... キャプション本文(次の見出しの手前まで)
+  ### 商品リンク   ... (使用しない)
+
+投稿が終わったら、そのページの「チェックボックス」をオンにする。
+GitHub Actionsから1日1回実行される想定。
 """
 
+import datetime as dt
 import os
 import sys
 import time
-import shutil
-from pathlib import Path
 
 import requests
+
+NOTION_VERSION = "2022-06-28"
+NOTION_API_BASE = "https://api.notion.com/v1"
 
 GRAPH_API_VERSION = "v21.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+PLATFORM_TAG = "Instagram \U0001F4F8"
+STATUS_READY = "予約済み"  # 予約済み
 
-POSTS_DIR = Path("posts")
-POSTS_DONE_DIR = Path("posts_done")
+HEADING_TYPES = {"heading_1", "heading_2", "heading_3"}
+IMAGE_HEADING = "元画像"      # 元画像
+POST_IMAGE_HEADING = "投稿画像"  # 投稿画像
+CAPTION_HEADING = "投稿内容"     # 投稿内容
 
 
 def get_env(name: str) -> str:
@@ -37,36 +47,114 @@ def get_env(name: str) -> str:
     return value
 
 
-def find_next_post_dir() -> Path | None:
-    if not POSTS_DIR.exists():
+def notion_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def find_next_page(token: str, database_id: str) -> dict | None:
+    today = dt.date.today().isoformat()
+    payload = {
+        "filter": {
+            "and": [
+                {"property": "ステータス", "status": {"equals": STATUS_READY}},
+                {"property": "チェックボックス", "checkbox": {"equals": False}},
+                {"property": "プラットフォーム", "multi_select": {"contains": PLATFORM_TAG}},
+                {"property": "投稿日付", "date": {"on_or_before": today}},
+            ]
+        },
+        "sorts": [{"property": "投稿日付", "direction": "ascending"}],
+        "page_size": 1,
+    }
+    resp = requests.post(
+        f"{NOTION_API_BASE}/databases/{database_id}/query",
+        headers=notion_headers(token),
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    return results[0] if results else None
+
+
+def get_all_children(token: str, block_id: str) -> list[dict]:
+    blocks = []
+    cursor = None
+    while True:
+        params = {"page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        resp = requests.get(
+            f"{NOTION_API_BASE}/blocks/{block_id}/children",
+            headers=notion_headers(token),
+            params=params,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        blocks.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return blocks
+
+
+def collect_image_urls(token: str, blocks: list[dict]) -> list[str]:
+    urls = []
+    for block in blocks:
+        btype = block.get("type")
+        if btype == "image":
+            image = block["image"]
+            url = image.get("file", {}).get("url") or image.get("external", {}).get("url")
+            if url:
+                urls.append(url)
+        elif block.get("has_children") and btype in ("column_list", "column"):
+            children = get_all_children(token, block["id"])
+            urls.extend(collect_image_urls(token, children))
+    return urls
+
+
+def block_plain_text(block: dict) -> str:
+    btype = block.get("type")
+    data = block.get(btype, {})
+    rich_text = data.get("rich_text", [])
+    return "".join(rt.get("plain_text", "") for rt in rich_text)
+
+
+def heading_text(block: dict) -> str | None:
+    btype = block.get("type")
+    if btype not in HEADING_TYPES:
         return None
-    candidates = sorted(
-        p for p in POSTS_DIR.iterdir()
-        if p.is_dir() and not p.name.startswith(".")
-    )
-    return candidates[0] if candidates else None
+    return block_plain_text(block).strip()
 
 
-def load_caption(post_dir: Path) -> str:
-    caption_file = post_dir / "caption.txt"
-    if not caption_file.exists():
-        return ""
-    return caption_file.read_text(encoding="utf-8").strip()
+def split_into_sections(blocks: list[dict]) -> dict[str, list[dict]]:
+    sections: dict[str, list[dict]] = {}
+    current = None
+    for block in blocks:
+        title = heading_text(block)
+        if title is not None:
+            current = title
+            sections[current] = []
+            continue
+        if current is not None:
+            sections[current].append(block)
+    return sections
 
 
-def list_image_files(post_dir: Path) -> list[Path]:
-    files = sorted(
-        p for p in post_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-    )
-    if len(files) > 10:
-        print(f"警告: 画像が10枚を超えています。先頭10枚のみ使用します: {post_dir}")
-        files = files[:10]
-    return files
+def extract_images(token: str, sections: dict[str, list[dict]]) -> list[str]:
+    post_images = collect_image_urls(token, sections.get(POST_IMAGE_HEADING, []))
+    if post_images:
+        return post_images
+    return collect_image_urls(token, sections.get(IMAGE_HEADING, []))
 
 
-def build_raw_url(repo: str, branch: str, post_dir: Path, filename: str) -> str:
-    return f"https://raw.githubusercontent.com/{repo}/{branch}/{post_dir.as_posix()}/{filename}"
+def extract_caption(sections: dict[str, list[dict]]) -> str:
+    lines = [block_plain_text(b) for b in sections.get(CAPTION_HEADING, [])]
+    return "\n".join(line for line in lines if line).strip()
 
 
 def wait_until_finished(container_id: str, access_token: str, timeout_sec: int = 120) -> None:
@@ -126,50 +214,66 @@ def publish_container(ig_user_id: str, access_token: str, container_id: str) -> 
     return resp.json()["id"]
 
 
-def main() -> None:
-    access_token = get_env("IG_ACCESS_TOKEN")
-    ig_user_id = get_env("IG_BUSINESS_ACCOUNT_ID")
-    repo = get_env("GITHUB_REPOSITORY")
-    branch = os.environ.get("GITHUB_REF_NAME", "main")
+def mark_as_posted(token: str, page_id: str) -> None:
+    payload = {"properties": {"チェックボックス": {"checkbox": True}}}
+    resp = requests.patch(
+        f"{NOTION_API_BASE}/pages/{page_id}",
+        headers=notion_headers(token),
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
 
-    post_dir = find_next_post_dir()
-    if post_dir is None:
-        print("posts/ に投稿待ちのフォルダがありません。何もせず終了します。")
+
+def post_images(ig_user_id: str, access_token: str, images: list[str], caption: str) -> str:
+    if len(images) == 1:
+        container_id = create_image_container(ig_user_id, access_token, images[0], caption=caption)
+        wait_until_finished(container_id, access_token)
+        return publish_container(ig_user_id, access_token, container_id)
+
+    child_ids = []
+    for image_url in images[:10]:
+        child_id = create_image_container(ig_user_id, access_token, image_url, is_carousel_item=True)
+        wait_until_finished(child_id, access_token)
+        child_ids.append(child_id)
+
+    carousel_id = create_carousel_container(ig_user_id, access_token, child_ids, caption)
+    wait_until_finished(carousel_id, access_token)
+    return publish_container(ig_user_id, access_token, carousel_id)
+
+
+def main() -> None:
+    notion_token = get_env("NOTION_TOKEN")
+    database_id = get_env("NOTION_DATABASE_ID")
+    ig_access_token = get_env("IG_ACCESS_TOKEN")
+    ig_user_id = get_env("IG_BUSINESS_ACCOUNT_ID")
+
+    page = find_next_page(notion_token, database_id)
+    if page is None:
+        print("投稿予定のページが見つかりませんでした。何もせず終了します。")
         return
 
-    caption = load_caption(post_dir)
-    images = list_image_files(post_dir)
+    page_id = page["id"]
+    title_prop = page["properties"].get("件名", {}).get("title", [])
+    title = "".join(rt.get("plain_text", "") for rt in title_prop) or page_id
+    print(f"投稿対象: {title} ({page_id})")
+
+    blocks = get_all_children(notion_token, page_id)
+    sections = split_into_sections(blocks)
+
+    images = extract_images(notion_token, sections)
     if not images:
-        print(f"エラー: {post_dir} に画像が見つかりません", file=sys.stderr)
+        print(f"エラー: {title} に画像が見つかりません", file=sys.stderr)
         sys.exit(1)
 
-    print(f"投稿対象: {post_dir} (画像 {len(images)} 枚)")
+    caption = extract_caption(sections)
+    print(f"画像 {len(images)} 枚 / キャプション {len(caption)} 文字")
 
-    if len(images) == 1:
-        image_url = build_raw_url(repo, branch, post_dir, images[0].name)
-        container_id = create_image_container(ig_user_id, access_token, image_url, caption=caption)
-        wait_until_finished(container_id, access_token)
-        media_id = publish_container(ig_user_id, access_token, container_id)
-    else:
-        child_ids = []
-        for image in images:
-            image_url = build_raw_url(repo, branch, post_dir, image.name)
-            child_id = create_image_container(
-                ig_user_id, access_token, image_url, is_carousel_item=True
-            )
-            wait_until_finished(child_id, access_token)
-            child_ids.append(child_id)
-
-        carousel_id = create_carousel_container(ig_user_id, access_token, child_ids, caption)
-        wait_until_finished(carousel_id, access_token)
-        media_id = publish_container(ig_user_id, access_token, carousel_id)
-
+    media_id = post_images(ig_user_id, ig_access_token, images, caption)
     print(f"投稿に成功しました: media_id={media_id}")
 
-    POSTS_DONE_DIR.mkdir(exist_ok=True)
-    destination = POSTS_DONE_DIR / post_dir.name
-    shutil.move(str(post_dir), str(destination))
-    print(f"{post_dir} を {destination} へ移動しました")
+    mark_as_posted(notion_token, page_id)
+    print(f"Notion側の「チェックボックス」をオンにしました: {title}")
 
 
 if __name__ == "__main__":

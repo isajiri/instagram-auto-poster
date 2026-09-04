@@ -6,9 +6,6 @@ on:
     - cron: "0 0 * * *"
   workflow_dispatch: {}   # Actionsタブから手動実行するためのボタン
 
-permissions:
-  contents: write
-
 jobs:
   post:
     runs-on: ubuntu-latest
@@ -24,16 +21,10 @@ jobs:
       - name: 依存パッケージをインストール
         run: pip install -r requirements.txt
 
-      - name: Instagramへ投稿
+      - name: Notionを確認してInstagramへ投稿
         env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_BUSINESS_ACCOUNT_ID: ${{ secrets.IG_BUSINESS_ACCOUNT_ID }}
         run: python scripts/post_to_instagram.py
-
-      - name: 投稿済みフォルダの移動をコミット
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add posts posts_done
-          git diff --cached --quiet || git commit -m "chore: 投稿済み分をposts_doneへ移動"
-          git push
