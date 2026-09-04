@@ -2,7 +2,7 @@
 Notionの「SNS投稿カレンダー」を投稿キューとして、Instagramへ自動投稿するスクリプト。
 
 対象にする行の条件:
-  - ステータス == "記事完成/予約待ち"
+  - ステータス == "自動投稿"
   - チェックボックス == オフ(未投稿)
   - プラットフォーム に "Instagram \U0001F4F8" を含む
   - 投稿日付 <= 今日
@@ -31,7 +31,7 @@ GRAPH_API_VERSION = "v21.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 PLATFORM_TAG = "Instagram \U0001F4F8"
-STATUS_READY = "記事完成/予約待ち"  # 記事完成/予約待ち(この状態のものを自動投稿する)
+STATUS_READY = "自動投稿"  # この状態のものを対象に自動投稿する
 
 HEADING_TYPES = {"heading_1", "heading_2", "heading_3"}
 IMAGE_HEADING = "元画像"      # 元画像
